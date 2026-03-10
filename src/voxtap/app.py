@@ -32,9 +32,11 @@ from PyQt6.QtWidgets import (
 from voxtap import clipboard
 
 # PID file location
-CACHE_DIR = os.path.join(
-    os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "voxtap"
-)
+if sys.platform == "win32":
+    _base = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+else:
+    _base = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
+CACHE_DIR = os.path.join(_base, "voxtap")
 PIDFILE = os.path.join(CACHE_DIR, "voxtap.pid")
 
 # UI Colors
@@ -371,8 +373,10 @@ class SpeechToTextWindow(QMainWindow):
 
         self._setup_gui()
 
-        # SIGUSR1 toggle (POSIX)
-        if sys.platform != "win32":
+        # IPC toggle: SIGUSR1 on POSIX, named event on Windows
+        if sys.platform == "win32":
+            self._setup_win32_toggle()
+        else:
             signal.signal(signal.SIGUSR1, self._handle_sigusr1)
 
         # PID file
@@ -705,6 +709,8 @@ class SpeechToTextWindow(QMainWindow):
     # --- Clipboard image paste ---
 
     def _try_get_clipboard_image_path(self) -> str | None:
+        if sys.platform == "win32":
+            return self._get_clipboard_image_path_windows()
         if sys.platform == "darwin":
             return self._get_clipboard_image_path_macos()
         return self._get_clipboard_image_path_linux()
@@ -765,6 +771,44 @@ class SpeechToTextWindow(QMainWindow):
             if result.returncode == 0 and result.stdout:
                 with open(filepath, "wb") as f:
                     f.write(result.stdout)
+                return filepath
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+        return None
+
+    def _get_clipboard_image_path_windows(self) -> str | None:
+        # Try file paths first (e.g. copied file in Explorer)
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-Clipboard -Format FileDropList | Select-Object -ExpandProperty FullName"],
+                capture_output=True, text=True, timeout=3,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                for line in result.stdout.strip().splitlines():
+                    path = line.strip()
+                    if os.path.isfile(path):
+                        return path
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+        # Try screenshot / image in clipboard
+        images_dir = os.path.join(CACHE_DIR, "images")
+        os.makedirs(images_dir, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = os.path.join(images_dir, f"paste_{timestamp}.png")
+
+        ps_script = (
+            "$img = Get-Clipboard -Format Image; "
+            f"if ($img) {{ $img.Save('{filepath}') }}"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_script],
+                capture_output=True, timeout=5,
+            )
+            if result.returncode == 0 and os.path.isfile(filepath):
                 return filepath
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
@@ -1111,6 +1155,25 @@ class SpeechToTextWindow(QMainWindow):
     def _handle_sigusr1(self, signum, frame):
         QTimer.singleShot(0, self._toggle_recording)
 
+    def _setup_win32_toggle(self):
+        """Create a Win32 named event and poll it with a QTimer."""
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        self._win32_event = kernel32.CreateEventW(None, True, False,
+                                                   "voxtap_toggle_event")
+        self._win32_timer = QTimer(self)
+        self._win32_timer.timeout.connect(self._poll_win32_event)
+        self._win32_timer.start(200)
+
+    def _poll_win32_event(self):
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        WAIT_OBJECT_0 = 0
+        result = kernel32.WaitForSingleObject(self._win32_event, 0)
+        if result == WAIT_OBJECT_0:
+            kernel32.ResetEvent(self._win32_event)
+            self._toggle_recording()
+
     def _restore_status(self):
         if self.recording:
             self.status_label.setText("Recording")
@@ -1132,6 +1195,10 @@ class SpeechToTextWindow(QMainWindow):
             os.remove(PIDFILE)
         except OSError:
             pass
+        # Clean up Win32 named event
+        if sys.platform == "win32" and hasattr(self, "_win32_event"):
+            import ctypes
+            ctypes.windll.kernel32.CloseHandle(self._win32_event)
         event.accept()
 
 

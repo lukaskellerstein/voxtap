@@ -14,6 +14,13 @@ import sys
 
 def _detect_clipboard_cmd() -> list[str]:
     """Return the command (as argv list) to pipe text into the clipboard."""
+    if sys.platform == "win32":
+        # PowerShell Set-Clipboard handles Unicode properly
+        return [
+            "powershell", "-NoProfile", "-Command",
+            "$input | Set-Clipboard",
+        ]
+
     if sys.platform == "darwin":
         if shutil.which("pbcopy"):
             return ["pbcopy"]

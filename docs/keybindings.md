@@ -58,6 +58,22 @@ Or use **Settings > Keyboard > Custom Shortcuts** in the GUI.
 3. Set the trigger to your preferred key (e.g., `Meta+Shift+T`)
 4. Set the command to `voxtap-toggle`
 
+## Windows (AutoHotkey)
+
+Install [AutoHotkey v2](https://www.autohotkey.com/) and create a script (e.g., `voxtap.ahk`):
+
+```autohotkey
+#+t::Run "voxtap-toggle"
+```
+
+`#+t` means **Win+Shift+T**. Double-click the `.ahk` file to start, or place it in your Startup folder.
+
+## Windows (PowerToys)
+
+1. Install [Microsoft PowerToys](https://learn.microsoft.com/en-us/windows/powertoys/)
+2. Open **Keyboard Manager > Remap a shortcut**
+3. Map your preferred shortcut (e.g., `Win+Shift+T`) to run `voxtap-toggle`
+
 ## macOS (skhd)
 
 Install [skhd](https://github.com/koekeishiya/skhd):
