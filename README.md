@@ -8,8 +8,9 @@ Tap a key, get voice transcribed. Local speech-to-text powered by [faster-whispe
 - Animated waveform + breathing border while recording
 - Pauses Spotify automatically during recording
 - Paste screenshots as file paths (Ctrl+V)
-- Toggle recording on/off with a single keybinding
-- Cross-platform: Linux (X11 & Wayland) and macOS
+- Toggle recording on/off with a single keybinding (`voxtap-toggle`)
+- Optional LLM polish via local [Ollama](https://ollama.com/) — cleans filler words, fixes punctuation
+- Cross-platform: Linux (X11 & Wayland), macOS, and Windows
 
 ## Quick Start
 
@@ -50,6 +51,10 @@ brew install portaudio
 # pbcopy ships with macOS — no extra clipboard tool needed
 ```
 
+### Windows
+
+No extra system dependencies are needed — PortAudio is bundled with the `sounddevice` Python package and clipboard access uses PowerShell.
+
 ## Usage
 
 ```bash
@@ -60,9 +65,9 @@ voxtap --language de                # Transcribe German
 voxtap --device cpu                 # Force CPU (skip CUDA auto-detection)
 ```
 
-### Keybinding
+### Toggle Keybinding
 
-Bind `voxtap` to a key in your window manager for quick access. See [docs/keybindings.md](docs/keybindings.md) for setup instructions for i3, Sway, Hyprland, GNOME, KDE, and macOS.
+Bind `voxtap-toggle` to a key in your window manager for quick access. If an instance is already running, it toggles recording on/off; otherwise it launches a new one. See [docs/keybindings.md](docs/keybindings.md) for setup instructions for i3, Sway, Hyprland, GNOME, KDE, Windows, and macOS.
 
 ## Configuration
 
@@ -88,8 +93,24 @@ Bind `voxtap` to a key in your window manager for quick access. See [docs/keybin
 2. Audio is buffered and transcribed every 1.5 seconds using faster-whisper
 3. Transcribed text is appended to the editor (or replaces selected text)
 4. You can pause recording, edit text freely, then resume
-5. On close (Escape), the editor content is copied to clipboard as Markdown
-6. Spotify is automatically paused during recording and resumed when you stop
+5. If [Ollama](https://ollama.com/) is running locally, transcribed text is polished (filler words removed, punctuation fixed)
+6. On close (Escape), the editor content is copied to clipboard as Markdown
+7. Spotify is automatically paused during recording and resumed when you stop (Linux)
+
+## LLM Polish (Optional)
+
+voxtap can use a local LLM via [Ollama](https://ollama.com/) to clean up transcriptions — removing filler words, fixing punctuation, and correcting repeated words. This step is entirely optional; transcription works fine without it.
+
+1. Install Ollama: https://ollama.com/download
+2. Pull the model:
+
+```bash
+ollama pull gpt-oss:20b
+```
+
+3. Make sure Ollama is running (`ollama serve` or the desktop app), then start voxtap as usual. The status bar will show the active LLM model.
+
+If Ollama is not running or the model is not available, voxtap silently skips the polish step.
 
 ## Troubleshooting
 
@@ -100,6 +121,8 @@ Bind `voxtap` to a key in your window manager for quick access. See [docs/keybin
 **CUDA not detected** — Install PyTorch with CUDA support, or use `--device cpu`.
 
 **Slow on CPU** — Use a smaller model: `voxtap --model small`.
+
+**LLM polish not working** — Make sure [Ollama](https://ollama.com/) is running and the model is available. This feature is optional; transcription works fine without it.
 
 ## License
 
