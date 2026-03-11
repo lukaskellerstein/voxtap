@@ -3,6 +3,7 @@
 import argparse
 import datetime
 import inspect
+import json
 import math
 import os
 import queue
@@ -10,6 +11,8 @@ import signal
 import subprocess
 import sys
 import threading
+import urllib.request
+import urllib.error
 
 import numpy as np
 import sounddevice as sd
@@ -49,10 +52,63 @@ ACCENT_RED = "#ff6b6b"
 ACCENT_GREEN = "#51cf66"
 ACCENT_BLUE = "#4dabf7"
 ACCENT_YELLOW = "#ffd43b"
+ACCENT_PURPLE = "#b197fc"
 BORDER_COLOR = "#45475a"
 
 SAMPLE_RATE = 16000
-CHUNK_INTERVAL = 1.5
+CHUNK_INTERVAL = 3.0
+
+# Initial prompt biases Whisper toward recognizing abbreviations and technical
+# terms that it would otherwise expand into common speech (e.g. "UI" → "you
+# are").  Keep it short — long prompts cause Whisper to hallucinate prompt
+# content on silence.  Each term should appear only once.
+INITIAL_PROMPT = (
+    "UI, UX, API, URL, HTML, CSS, TypeScript, SDK, CLI, GPU, CPU, RAM, "
+    "SQL, NoSQL, JSON, YAML, REST, GraphQL, ORM, IDE, CI, CD, DevOps, "
+    "AWS, GCP, LLM, AI, ML, NLP, GPT, CUDA, OAuth, JWT, "
+    "Docker, Kubernetes, kubectl, Helm, ConfigMap, DaemonSet, Dockerfile, "
+    "Ollama, Whisper, Qwen, Claude, Anthropic"
+)
+
+LLM_SYSTEM_PROMPT = (
+    "You are a post-processor for raw speech-to-text transcription. "
+    "The input may have minor issues from automatic transcription.\n\n"
+    "Your tasks:\n"
+    "1. Remove filler words: um, uh, like, you know, I mean.\n"
+    "2. Remove consecutively repeated words (e.g. 'kubectl kubectl kubectl' → 'kubectl').\n"
+    "3. Fix punctuation, capitalization, spelling, and grammar.\n"
+    "4. Keep technical terms (API, Kubernetes, Docker, Ollama, etc.) correctly cased.\n\n"
+    "CRITICAL RULES:\n"
+    "- NEVER remove or change content that could be intentional. "
+    "When in doubt, keep it.\n"
+    "- Preserve the speaker's original meaning, intent, and ALL topics exactly.\n"
+    "- Do NOT add information, rephrase ideas, summarize, or change the tone.\n"
+    "- Do NOT remove words or sentences just because they seem unrelated — "
+    "the speaker may be discussing multiple topics.\n\n"
+    "Output ONLY the cleaned text. No explanations, no commentary, no quotes."
+)
+
+# Common Whisper hallucination phrases (lowercase).
+_HALLUCINATIONS = frozenset([
+    "thank you for watching",
+    "thanks for watching",
+    "subscribe",
+    "like and subscribe",
+    "please subscribe",
+    "thank you for listening",
+    "thanks for listening",
+    "see you next time",
+    "bye bye",
+    "goodbye",
+    "the end",
+    "subtitles by",
+    "translated by",
+    "amara.org",
+    "www.mooji.org",
+])
+
+OLLAMA_URL = "http://localhost:11434/api/chat"
+OLLAMA_MODEL = "gpt-oss:20b"
 
 STYLESHEET = f"""
 QMainWindow {{
@@ -229,14 +285,79 @@ class WaveformWidget(QWidget):
         painter.end()
 
 
+# --- Polishing indicator (animated dots) ---
+
+class PolishingWidget(QWidget):
+    """Animated dots shown while the LLM polishes transcription."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._num_dots = 5
+        self._dot_r = 3
+        self._gap = 5
+        self._tick = 0
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._animate)
+        self.setFixedSize(
+            self._num_dots * (self._dot_r * 2 + self._gap) - self._gap,
+            self._dot_r * 2 + 4,
+        )
+        self.hide()
+
+    def start(self):
+        self._tick = 0
+        self.show()
+        self._timer.start(60)
+
+    def stop(self):
+        self._timer.stop()
+        self.hide()
+
+    def _animate(self):
+        self._tick += 1
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        t = self._tick * 0.18
+        cy = self.height() / 2
+
+        for i in range(self._num_dots):
+            phase = i * 0.7
+            # Each dot pulses in opacity and bounces vertically
+            wave = (math.sin(t + phase) + 1) / 2  # 0..1
+            alpha = int(80 + 175 * wave)
+            y_off = -3 * math.sin(t + phase)
+            x = i * (self._dot_r * 2 + self._gap) + self._dot_r
+            color = QColor(ACCENT_BLUE)
+            color.setAlpha(alpha)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            painter.drawEllipse(
+                int(x - self._dot_r), int(cy + y_off - self._dot_r),
+                self._dot_r * 2, self._dot_r * 2,
+            )
+
+        painter.end()
+
+
 # --- Animated border frame ---
 
 class GlowFrame(QFrame):
-    """Frame with animated border glow."""
+    """Frame with animated border glow. Supports red (recording) and blue (polishing) modes."""
+
+    # Color targets: (r, g, b) that the border pulses toward.
+    _COLORS = {
+        "red":  (0xff, 0x6b, 0x6b),
+        "blue": (0x4d, 0xab, 0xf7),
+    }
+    _BASE = (0x45, 0x47, 0x5a)  # border color at rest
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._glow = 0.0
+        self._color_mode = "red"
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._animate)
         self._tick = 0
@@ -253,15 +374,18 @@ class GlowFrame(QFrame):
 
     def _update_border(self):
         p = self._glow
-        r = int(0x45 + (0xff - 0x45) * p)
-        g = int(0x47 + (0x6b - 0x47) * p)
-        b = int(0x5a + (0x6b - 0x5a) * p)
+        tr, tg, tb = self._COLORS.get(self._color_mode, self._COLORS["red"])
+        br, bg_, bb = self._BASE
+        r = int(br + (tr - br) * p)
+        g = int(bg_ + (tg - bg_) * p)
+        b = int(bb + (tb - bb) * p)
         self.setStyleSheet(
             f"GlowFrame {{ border: 2px solid #{r:02x}{g:02x}{b:02x}; "
             f"border-radius: 4px; background-color: transparent; }}"
         )
 
-    def start(self):
+    def start(self, color="red"):
+        self._color_mode = color
         self._tick = 0
         self._timer.start(50)
 
@@ -282,6 +406,9 @@ class GlowFrame(QFrame):
 class TranscriptionBridge(QObject):
     """Thread-safe signal to deliver transcription text to the GUI."""
     text_ready = pyqtSignal(str)
+    text_replaced = pyqtSignal(int, str)  # start_pos, polished_text
+    polishing = pyqtSignal(bool)  # True = started, False = finished
+    editor_text_requested = pyqtSignal()  # request current editor text from main thread
     error = pyqtSignal(str)
     download_progress = pyqtSignal(int, int)  # downloaded_bytes, total_bytes
     download_done = pyqtSignal()
@@ -344,7 +471,7 @@ class DownloadDialog(QDialog):
 # --- Main window ---
 
 class SpeechToTextWindow(QMainWindow):
-    def __init__(self, model_name="distil-large-v3", language="en", device=None):
+    def __init__(self, model_name="large-v3", language="en", device=None):
         super().__init__()
         self.model_name = model_name
         self.language = language
@@ -356,12 +483,30 @@ class SpeechToTextWindow(QMainWindow):
         self.stream = None
         self.transcription_thread = None
         self._media_was_playing = False
+        self._recorded_audio = None  # Full recording as numpy array
+        self._playback_stream = None  # sounddevice OutputStream for playback
+        self._playback_pos = 0  # Current playback position in samples
 
         self._bridge = TranscriptionBridge()
         self._bridge.text_ready.connect(self._insert_transcription)
+        self._bridge.text_replaced.connect(self._replace_session_text)
+        self._bridge.polishing.connect(self._on_polishing)
+        self._bridge.editor_text_requested.connect(self._provide_editor_text)
         self._bridge.error.connect(
             lambda msg: self.status_label.setText(f"Error: {msg}")
         )
+        # Accumulates raw transcription text during a recording session.
+        # Used to polish the full text when recording stops.
+        self._session_raw_parts: list[str] = []
+        # Cursor position where the current session's text starts, so we can
+        # replace raw text with the polished version.
+        self._session_start_pos: int = 0
+        # Thread-safe mechanism to read editor text from background thread.
+        self._editor_text_response = ""
+        self._editor_text_event = threading.Event()
+        # Tracks whether we are currently polishing or have finished polishing.
+        self._is_polishing = False
+        self._polish_done = False
 
         self.setWindowTitle("voxtap")
         self.setMinimumSize(400, 300)
@@ -410,11 +555,34 @@ class SpeechToTextWindow(QMainWindow):
         self.waveform = WaveformWidget()
         tb_layout.addWidget(self.waveform)
 
+        self.polish_indicator = PolishingWidget()
+        tb_layout.addWidget(self.polish_indicator)
+
         self.status_label = QLabel("Loading model...")
         self.status_label.setObjectName("status")
         tb_layout.addWidget(self.status_label)
 
         layout.addWidget(title_bar)
+
+        # --- Model info strip ---
+        info_bar = QWidget()
+        info_bar.setFixedHeight(22)
+        info_bar.setStyleSheet(f"background-color: {BG_DARK};")
+        info_layout = QHBoxLayout(info_bar)
+        info_layout.setContentsMargins(15, 0, 15, 0)
+        info_layout.setSpacing(12)
+
+        style_info = f"color: {FG_SECONDARY}; font-size: 10px;"
+        whisper_label = QLabel(f"STT: {self.model_name}")
+        whisper_label.setStyleSheet(style_info)
+        info_layout.addWidget(whisper_label)
+
+        llm_label = QLabel(f"LLM: {OLLAMA_MODEL}")
+        llm_label.setStyleSheet(style_info)
+        info_layout.addWidget(llm_label)
+
+        info_layout.addStretch()
+        layout.addWidget(info_bar)
 
         # --- Formatting toolbar ---
         toolbar = QToolBar()
@@ -542,6 +710,18 @@ class SpeechToTextWindow(QMainWindow):
         self.record_btn.clicked.connect(self._toggle_recording)
         btn_layout.addWidget(self.record_btn)
 
+        self.play_btn = QPushButton("Play")
+        self.play_btn.setStyleSheet(_btn_style(ACCENT_GREEN))
+        self.play_btn.setEnabled(False)
+        self.play_btn.clicked.connect(self._toggle_playback)
+        btn_layout.addWidget(self.play_btn)
+
+        self.transcribe_btn = QPushButton("Transcribe")
+        self.transcribe_btn.setStyleSheet(_btn_style(ACCENT_PURPLE))
+        self.transcribe_btn.setEnabled(False)
+        self.transcribe_btn.clicked.connect(self._transcribe_full_recording)
+        btn_layout.addWidget(self.transcribe_btn)
+
         copy_btn = QPushButton("Copy as Markdown")
         copy_btn.setStyleSheet(_btn_style(ACCENT_BLUE))
         copy_btn.clicked.connect(self.copy_to_clipboard)
@@ -578,7 +758,21 @@ class SpeechToTextWindow(QMainWindow):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
-            self.close()
+            if self.recording:
+                # Escape while recording → stop recording
+                self.stop_recording()
+            elif self._playback_stream is not None:
+                # Escape during playback → stop playback
+                self._stop_playback()
+            elif self._is_polishing:
+                # Escape while polishing → ignore, wait for it to finish
+                pass
+            elif self._polish_done:
+                # Escape after polish → copy to clipboard and close
+                self.copy_to_clipboard()
+                self.close()
+            else:
+                self.close()
         else:
             super().keyPressEvent(event)
 
@@ -907,6 +1101,23 @@ class SpeechToTextWindow(QMainWindow):
 
     # --- Transcription insertion ---
 
+    def _on_polishing(self, active):
+        self._is_polishing = active
+        if active:
+            self._polish_done = False
+            self._pre_polish_status = self.status_label.text()
+            self._pre_polish_style = self.status_label.styleSheet()
+            self.status_label.setText("Polishing...")
+            self.status_label.setStyleSheet(f"color: {ACCENT_BLUE};")
+            self.polish_indicator.start()
+            self.glow_frame.start("blue")
+        else:
+            self._polish_done = True
+            self.polish_indicator.stop()
+            self.glow_frame.stop()
+            self.status_label.setText("Polished — Esc to copy & close")
+            self.status_label.setStyleSheet(f"color: {ACCENT_GREEN};")
+
     def _insert_transcription(self, text):
         cursor = self.editor.textCursor()
         if cursor.hasSelection():
@@ -921,6 +1132,23 @@ class SpeechToTextWindow(QMainWindow):
                 cursor.insertText(text)
         self.editor.setTextCursor(cursor)
         self.editor.ensureCursorVisible()
+
+    def _replace_session_text(self, start_pos, polished):
+        """Replace raw session text (from start_pos to end) with polished text."""
+        cursor = self.editor.textCursor()
+        cursor.setPosition(start_pos)
+        cursor.movePosition(QTextCursor.MoveOperation.End, QTextCursor.MoveMode.KeepAnchor)
+        # Add leading space if session didn't start at beginning
+        prefix = " " if start_pos > 0 else ""
+        cursor.insertText(prefix + polished)
+        self.editor.setTextCursor(cursor)
+        self.editor.ensureCursorVisible()
+
+    def _provide_editor_text(self):
+        """Main-thread slot: read session text from editor and hand it to the background thread."""
+        plain = self.editor.toPlainText()
+        self._editor_text_response = plain[self._session_start_pos:]
+        self._editor_text_event.set()
 
     # --- Model loading ---
 
@@ -1017,13 +1245,13 @@ class SpeechToTextWindow(QMainWindow):
     def _resolve_device(self) -> tuple[str, str]:
         if self.device_override:
             if self.device_override == "cuda":
-                return "cuda", "float16"
+                return "cuda", "int8_float16"
             return self.device_override, "int8"
 
         try:
             import torch
             if torch.cuda.is_available():
-                return "cuda", "float16"
+                return "cuda", "int8_float16"
         except ImportError:
             pass
 
@@ -1031,7 +1259,8 @@ class SpeechToTextWindow(QMainWindow):
 
     def _on_model_loaded(self):
         self.record_btn.setEnabled(True)
-        self.start_recording()
+        self.status_label.setText("Ready — press Record")
+        self.status_label.setStyleSheet(f"color: {ACCENT_GREEN};")
 
     # --- Recording ---
 
@@ -1044,8 +1273,18 @@ class SpeechToTextWindow(QMainWindow):
     def start_recording(self):
         if self.recording or self.model is None:
             return
+        self._stop_playback()
         self.recording = True
         self.audio_buffer = []
+        self._recorded_audio = None
+        self._session_raw_parts = []
+        self._session_start_pos = len(self.editor.toPlainText())
+        self._polish_done = False
+        self._is_polishing = False
+
+        # Disable play/transcribe while recording
+        self.play_btn.setEnabled(False)
+        self.transcribe_btn.setEnabled(False)
 
         while not self.audio_queue.empty():
             try:
@@ -1072,7 +1311,7 @@ class SpeechToTextWindow(QMainWindow):
         self.stream.start()
 
         self.transcription_thread = threading.Thread(
-            target=self._transcription_loop, daemon=True,
+            target=self._recording_accumulate_loop, daemon=True,
         )
         self.transcription_thread.start()
 
@@ -1080,7 +1319,8 @@ class SpeechToTextWindow(QMainWindow):
         if self.recording:
             self.audio_queue.put(indata.copy())
 
-    def _transcription_loop(self):
+    def _recording_accumulate_loop(self):
+        """Background thread: drain audio queue into buffer while recording."""
         while self.recording:
             chunks = []
             try:
@@ -1088,22 +1328,11 @@ class SpeechToTextWindow(QMainWindow):
                     chunks.append(self.audio_queue.get_nowait())
             except queue.Empty:
                 pass
-
             if chunks:
                 self.audio_buffer.extend(chunks)
+            threading.Event().wait(0.1)
 
-            if self.audio_buffer:
-                total_samples = sum(c.shape[0] for c in self.audio_buffer)
-                if total_samples >= SAMPLE_RATE * CHUNK_INTERVAL:
-                    audio = np.concatenate(
-                        self.audio_buffer, axis=0,
-                    ).flatten()
-                    self.audio_buffer = []
-                    self._run_transcription(audio)
-
-            threading.Event().wait(0.5)
-
-        # Final transcription
+        # Drain any remaining chunks
         chunks = []
         try:
             while True:
@@ -1113,22 +1342,114 @@ class SpeechToTextWindow(QMainWindow):
         if chunks:
             self.audio_buffer.extend(chunks)
 
+        # Store the full recorded audio
         if self.audio_buffer:
-            audio = np.concatenate(self.audio_buffer, axis=0).flatten()
+            self._recorded_audio = np.concatenate(
+                self.audio_buffer, axis=0,
+            ).flatten()
             self.audio_buffer = []
-            self._run_transcription(audio)
+            # Enable playback and transcription buttons from main thread
+            QTimer.singleShot(0, self._on_recording_stored)
+
+    def _postprocess_text(self, text):
+        """Send text to local Ollama LLM for correction. Falls back to raw text."""
+        payload = json.dumps({
+            "model": OLLAMA_MODEL,
+            "stream": False,
+            "think": False,
+            "options": {"num_predict": max(len(text) * 2, 256)},
+            "messages": [
+                {"role": "system", "content": LLM_SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ],
+        }).encode()
+        req = urllib.request.Request(
+            OLLAMA_URL, data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read())
+            corrected = result["message"]["content"].strip()
+            return corrected if corrected else text
+        except (urllib.error.URLError, KeyError, TimeoutError):
+            return text
 
     def _run_transcription(self, audio):
         try:
+            # Prepend 300ms of silence so VAD does not clip speech onset.
+            pad = np.zeros(int(SAMPLE_RATE * 0.3), dtype=audio.dtype)
+            audio = np.concatenate([pad, audio])
+
             segments, _ = self.model.transcribe(
                 audio, language=self.language,
                 vad_filter=True, beam_size=5,
+                vad_parameters=dict(
+                    threshold=0.3,
+                    min_speech_duration_ms=100,
+                    speech_pad_ms=300,
+                ),
+                initial_prompt=INITIAL_PROMPT,
+                condition_on_previous_text=False,
+                temperature=(0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+                compression_ratio_threshold=1.35,
+                no_speech_threshold=0.45,
+                log_prob_threshold=-0.5,
+                repetition_penalty=1.1,
+                no_repeat_ngram_size=3,
             )
-            text_parts = [segment.text.strip() for segment in segments]
+            # Filter out hallucinated segments.
+            prompt_lower = INITIAL_PROMPT.lower()
+            text_parts = []
+            for seg in segments:
+                t = seg.text.strip()
+                if not t:
+                    continue
+                t_lower = t.lower()
+                # Drop known Whisper hallucination phrases
+                if any(h in t_lower for h in _HALLUCINATIONS):
+                    continue
+                # Drop segments whose words all appear in the prompt
+                words = [w.strip(".,;:!? ") for w in t_lower.split()]
+                if words and all(w in prompt_lower for w in words):
+                    continue
+                # Drop very low confidence segments
+                if seg.avg_logprob < -1.0:
+                    continue
+                # Drop segments that are just the same word repeated
+                unique = set(words)
+                if len(words) > 2 and len(unique) == 1:
+                    continue
+                text_parts.append(t)
             if text_parts:
-                self._bridge.text_ready.emit(" ".join(text_parts))
+                raw_text = " ".join(text_parts)
+                self._session_raw_parts.append(raw_text)
+                # Emit raw text immediately for live feedback
+                self._bridge.text_ready.emit(raw_text)
         except Exception as e:
             self._bridge.error.emit(str(e))
+
+    def _polish_session(self):
+        """Replace the raw session text with LLM-polished version."""
+        if not self._session_raw_parts:
+            return
+        # Read the actual editor text (includes any manual edits the user made).
+        self._editor_text_event.clear()
+        self._bridge.editor_text_requested.emit()
+        if not self._editor_text_event.wait(timeout=5):
+            # Fallback to raw parts if main thread didn't respond in time.
+            full_text = " ".join(self._session_raw_parts)
+        else:
+            full_text = self._editor_text_response.strip()
+        if not full_text:
+            return
+        self._bridge.polishing.emit(True)
+        try:
+            polished = self._postprocess_text(full_text)
+        finally:
+            self._bridge.polishing.emit(False)
+        # Replace the session text in the editor with the polished version
+        self._bridge.text_replaced.emit(self._session_start_pos, polished)
 
     def stop_recording(self):
         if not self.recording:
@@ -1142,8 +1463,8 @@ class SpeechToTextWindow(QMainWindow):
 
         self.waveform.stop()
         self.glow_frame.stop()
-        self.status_label.setText("Paused — edit text freely")
-        self.status_label.setStyleSheet(f"color: {ACCENT_GREEN};")
+        self.status_label.setText("Processing recording...")
+        self.status_label.setStyleSheet(f"color: {ACCENT_YELLOW};")
         self.record_btn.setText("Record")
         self.record_btn.setStyleSheet(_btn_style(ACCENT_RED))
 
@@ -1151,6 +1472,118 @@ class SpeechToTextWindow(QMainWindow):
         if self._media_was_playing:
             _media_play()
             self._media_was_playing = False
+
+    def _on_recording_stored(self):
+        """Called from main thread after recording audio is stored."""
+        if self._recorded_audio is not None and len(self._recorded_audio) > 0:
+            duration = len(self._recorded_audio) / SAMPLE_RATE
+            self.play_btn.setEnabled(True)
+            self.transcribe_btn.setEnabled(True)
+            self.status_label.setText(
+                f"Recorded {duration:.1f}s — Play to listen, or Transcribe"
+            )
+            self.status_label.setStyleSheet(f"color: {ACCENT_GREEN};")
+        else:
+            self.status_label.setText("No audio recorded")
+            self.status_label.setStyleSheet(f"color: {FG_SECONDARY};")
+
+    # --- Playback ---
+
+    def _toggle_playback(self):
+        if self._playback_stream is not None:
+            self._stop_playback()
+        else:
+            self._start_playback()
+
+    def _start_playback(self):
+        if self._recorded_audio is None:
+            return
+        self._playback_pos = 0
+        self.play_btn.setText("Stop")
+        self.play_btn.setStyleSheet(_btn_style(ACCENT_YELLOW))
+        self.record_btn.setEnabled(False)
+        self.transcribe_btn.setEnabled(False)
+        self.status_label.setText("Playing...")
+        self.status_label.setStyleSheet(f"color: {ACCENT_GREEN};")
+
+        def playback_callback(outdata, frames, time_info, status):
+            end = self._playback_pos + frames
+            audio = self._recorded_audio
+            if self._playback_pos >= len(audio):
+                outdata[:] = 0
+                raise sd.CallbackStop()
+            chunk = audio[self._playback_pos:end]
+            if len(chunk) < frames:
+                outdata[:len(chunk), 0] = chunk
+                outdata[len(chunk):] = 0
+                self._playback_pos = len(audio)
+                raise sd.CallbackStop()
+            else:
+                outdata[:, 0] = chunk
+                self._playback_pos = end
+
+        self._playback_stream = sd.OutputStream(
+            samplerate=SAMPLE_RATE, channels=1, dtype="float32",
+            callback=playback_callback,
+            finished_callback=lambda: QTimer.singleShot(0, self._on_playback_finished),
+        )
+        self._playback_stream.start()
+
+    def _stop_playback(self):
+        if self._playback_stream is not None:
+            stream = self._playback_stream
+            self._playback_stream = None
+            stream.stop()
+            stream.close()
+            self._on_playback_finished()
+
+    def _on_playback_finished(self):
+        if self._playback_stream is not None:
+            self._playback_stream.close()
+        self._playback_stream = None
+        self.play_btn.setText("Play")
+        self.play_btn.setStyleSheet(_btn_style(ACCENT_GREEN))
+        self.record_btn.setEnabled(True)
+        if self._recorded_audio is not None:
+            self.transcribe_btn.setEnabled(True)
+            duration = len(self._recorded_audio) / SAMPLE_RATE
+            self.status_label.setText(
+                f"Recorded {duration:.1f}s — Play to listen, or Transcribe"
+            )
+        self.status_label.setStyleSheet(f"color: {ACCENT_GREEN};")
+
+    # --- Full transcription ---
+
+    def _transcribe_full_recording(self):
+        """Transcribe the entire recorded audio, then polish."""
+        if self._recorded_audio is None or self.model is None:
+            return
+        self._stop_playback()
+        self.play_btn.setEnabled(False)
+        self.transcribe_btn.setEnabled(False)
+        self.record_btn.setEnabled(False)
+        self._session_raw_parts = []
+        self._session_start_pos = len(self.editor.toPlainText())
+        self._polish_done = False
+        self._is_polishing = False
+
+        self.status_label.setText("Transcribing...")
+        self.status_label.setStyleSheet(f"color: {ACCENT_BLUE};")
+        self.glow_frame.start("blue")
+
+        def run():
+            self._run_transcription(self._recorded_audio)
+            self._polish_session()
+            QTimer.singleShot(0, self._on_transcription_complete)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_transcription_complete(self):
+        self.glow_frame.stop()
+        self.record_btn.setEnabled(True)
+        if self._recorded_audio is not None:
+            self.play_btn.setEnabled(True)
+            self.transcribe_btn.setEnabled(True)
 
     def _handle_sigusr1(self, signum, frame):
         QTimer.singleShot(0, self._toggle_recording)
@@ -1178,11 +1611,18 @@ class SpeechToTextWindow(QMainWindow):
         if self.recording:
             self.status_label.setText("Recording")
             self.status_label.setStyleSheet(f"color: {ACCENT_RED};")
+        elif self._recorded_audio is not None:
+            duration = len(self._recorded_audio) / SAMPLE_RATE
+            self.status_label.setText(
+                f"Recorded {duration:.1f}s — Play to listen, or Transcribe"
+            )
+            self.status_label.setStyleSheet(f"color: {ACCENT_GREEN};")
         else:
-            self.status_label.setText("Paused — edit text freely")
+            self.status_label.setText("Ready — press Record")
             self.status_label.setStyleSheet(f"color: {ACCENT_GREEN};")
 
     def closeEvent(self, event):
+        self._stop_playback()
         self.stop_recording()
         # Copy text as markdown to clipboard on exit
         md = self._to_markdown()
@@ -1208,8 +1648,8 @@ def main():
         description="Speech-to-text with Whisper. Tap a key, get voice transcribed.",
     )
     parser.add_argument(
-        "--model", default="distil-large-v3",
-        help="Whisper model name (default: distil-large-v3)",
+        "--model", default="large-v3",
+        help="Whisper model name (default: large-v3)",
     )
     parser.add_argument(
         "--language", default="en",
