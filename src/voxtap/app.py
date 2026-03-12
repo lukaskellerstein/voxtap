@@ -722,8 +722,14 @@ class SpeechToTextWindow(QMainWindow):
         self.transcribe_btn.clicked.connect(self._transcribe_full_recording)
         btn_layout.addWidget(self.transcribe_btn)
 
+        self.polish_btn = QPushButton("Polish")
+        self.polish_btn.setStyleSheet(_btn_style(ACCENT_BLUE))
+        self.polish_btn.setEnabled(False)
+        self.polish_btn.clicked.connect(self._polish_current_text)
+        btn_layout.addWidget(self.polish_btn)
+
         copy_btn = QPushButton("Copy as Markdown")
-        copy_btn.setStyleSheet(_btn_style(ACCENT_BLUE))
+        copy_btn.setStyleSheet(_btn_style(ACCENT_YELLOW))
         copy_btn.clicked.connect(self.copy_to_clipboard)
         btn_layout.addWidget(copy_btn)
 
@@ -757,22 +763,31 @@ class SpeechToTextWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def keyPressEvent(self, event):
+        # Don't intercept shortcuts when editor has focus (user is typing)
+        if self.editor.hasFocus():
+            super().keyPressEvent(event)
+            return
+
         if event.key() == Qt.Key.Key_Escape:
             if self.recording:
-                # Escape while recording → stop recording
                 self.stop_recording()
             elif self._playback_stream is not None:
-                # Escape during playback → stop playback
                 self._stop_playback()
             elif self._is_polishing:
-                # Escape while polishing → ignore, wait for it to finish
                 pass
             elif self._polish_done:
-                # Escape after polish → copy to clipboard and close
                 self.copy_to_clipboard()
                 self.close()
             else:
                 self.close()
+        elif event.key() == Qt.Key.Key_R:
+            self._toggle_recording()
+        elif event.key() == Qt.Key.Key_P:
+            self._toggle_playback()
+        elif event.key() == Qt.Key.Key_T:
+            self._transcribe_full_recording()
+        elif event.key() == Qt.Key.Key_L:
+            self._polish_current_text()
         else:
             super().keyPressEvent(event)
 
@@ -1259,7 +1274,7 @@ class SpeechToTextWindow(QMainWindow):
 
     def _on_model_loaded(self):
         self.record_btn.setEnabled(True)
-        self.status_label.setText("Ready — press Record")
+        self.status_label.setText("Ready — press R to record")
         self.status_label.setStyleSheet(f"color: {ACCENT_GREEN};")
 
     # --- Recording ---
@@ -1282,9 +1297,10 @@ class SpeechToTextWindow(QMainWindow):
         self._polish_done = False
         self._is_polishing = False
 
-        # Disable play/transcribe while recording
+        # Disable play/transcribe/polish while recording
         self.play_btn.setEnabled(False)
         self.transcribe_btn.setEnabled(False)
+        self.polish_btn.setEnabled(False)
 
         while not self.audio_queue.empty():
             try:
@@ -1299,7 +1315,7 @@ class SpeechToTextWindow(QMainWindow):
 
         self.status_label.setText("Recording")
         self.status_label.setStyleSheet(f"color: {ACCENT_RED};")
-        self.record_btn.setText("Pause")
+        self.record_btn.setText("Stop")
         self.record_btn.setStyleSheet(_btn_style(ACCENT_YELLOW))
         self.waveform.start()
         self.glow_frame.start()
@@ -1480,7 +1496,7 @@ class SpeechToTextWindow(QMainWindow):
             self.play_btn.setEnabled(True)
             self.transcribe_btn.setEnabled(True)
             self.status_label.setText(
-                f"Recorded {duration:.1f}s — Play to listen, or Transcribe"
+                f"Recorded {duration:.1f}s — Play, Transcribe, or Polish"
             )
             self.status_label.setStyleSheet(f"color: {ACCENT_GREEN};")
         else:
@@ -1503,6 +1519,7 @@ class SpeechToTextWindow(QMainWindow):
         self.play_btn.setStyleSheet(_btn_style(ACCENT_YELLOW))
         self.record_btn.setEnabled(False)
         self.transcribe_btn.setEnabled(False)
+        self.polish_btn.setEnabled(False)
         self.status_label.setText("Playing...")
         self.status_label.setStyleSheet(f"color: {ACCENT_GREEN};")
 
@@ -1544,23 +1561,25 @@ class SpeechToTextWindow(QMainWindow):
         self.play_btn.setText("Play")
         self.play_btn.setStyleSheet(_btn_style(ACCENT_GREEN))
         self.record_btn.setEnabled(True)
+        self.polish_btn.setEnabled(True)
         if self._recorded_audio is not None:
             self.transcribe_btn.setEnabled(True)
             duration = len(self._recorded_audio) / SAMPLE_RATE
             self.status_label.setText(
-                f"Recorded {duration:.1f}s — Play to listen, or Transcribe"
+                f"Recorded {duration:.1f}s — Play, Transcribe, or Polish"
             )
         self.status_label.setStyleSheet(f"color: {ACCENT_GREEN};")
 
     # --- Full transcription ---
 
     def _transcribe_full_recording(self):
-        """Transcribe the entire recorded audio, then polish."""
+        """Transcribe the entire recorded audio."""
         if self._recorded_audio is None or self.model is None:
             return
         self._stop_playback()
         self.play_btn.setEnabled(False)
         self.transcribe_btn.setEnabled(False)
+        self.polish_btn.setEnabled(False)
         self.record_btn.setEnabled(False)
         self._session_raw_parts = []
         self._session_start_pos = len(self.editor.toPlainText())
@@ -1573,7 +1592,6 @@ class SpeechToTextWindow(QMainWindow):
 
         def run():
             self._run_transcription(self._recorded_audio)
-            self._polish_session()
             QTimer.singleShot(0, self._on_transcription_complete)
 
         threading.Thread(target=run, daemon=True).start()
@@ -1581,6 +1599,34 @@ class SpeechToTextWindow(QMainWindow):
     def _on_transcription_complete(self):
         self.glow_frame.stop()
         self.record_btn.setEnabled(True)
+        if self._recorded_audio is not None:
+            self.play_btn.setEnabled(True)
+            self.transcribe_btn.setEnabled(True)
+        self.polish_btn.setEnabled(True)
+        self.status_label.setText("Transcribed — Polish to refine, or edit manually")
+        self.status_label.setStyleSheet(f"color: {ACCENT_GREEN};")
+
+    def _polish_current_text(self):
+        """Polish the current editor text with LLM."""
+        text = self.editor.toPlainText().strip()
+        if not text:
+            return
+        self.polish_btn.setEnabled(False)
+        self.record_btn.setEnabled(False)
+        self.play_btn.setEnabled(False)
+        self.transcribe_btn.setEnabled(False)
+        self._session_start_pos = 0
+        self._session_raw_parts = [text]
+
+        def run():
+            self._polish_session()
+            QTimer.singleShot(0, self._on_polish_complete)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _on_polish_complete(self):
+        self.record_btn.setEnabled(True)
+        self.polish_btn.setEnabled(True)
         if self._recorded_audio is not None:
             self.play_btn.setEnabled(True)
             self.transcribe_btn.setEnabled(True)
@@ -1614,11 +1660,11 @@ class SpeechToTextWindow(QMainWindow):
         elif self._recorded_audio is not None:
             duration = len(self._recorded_audio) / SAMPLE_RATE
             self.status_label.setText(
-                f"Recorded {duration:.1f}s — Play to listen, or Transcribe"
+                f"Recorded {duration:.1f}s — Play, Transcribe, or Polish"
             )
             self.status_label.setStyleSheet(f"color: {ACCENT_GREEN};")
         else:
-            self.status_label.setText("Ready — press Record")
+            self.status_label.setText("Ready — press R to record")
             self.status_label.setStyleSheet(f"color: {ACCENT_GREEN};")
 
     def closeEvent(self, event):
