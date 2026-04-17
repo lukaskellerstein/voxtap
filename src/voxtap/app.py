@@ -23,7 +23,7 @@ from PyQt6.QtCore import (
     pyqtProperty, pyqtSignal,
 )
 from PyQt6.QtGui import (
-    QAction, QColor, QFont, QKeySequence, QPainter,
+    QAction, QColor, QFont, QIcon, QKeySequence, QPainter,
     QTextBlockFormat, QTextCharFormat, QTextCursor, QTextListFormat,
 )
 from PyQt6.QtWidgets import (
@@ -41,6 +41,19 @@ else:
     _base = os.environ.get("XDG_CACHE_HOME", os.path.expanduser("~/.cache"))
 CACHE_DIR = os.path.join(_base, "voxtap")
 PIDFILE = os.path.join(CACHE_DIR, "voxtap.pid")
+
+
+def _resolve_icon_path() -> str | None:
+    """Locate logo-icon.png whether running from source or an installed wheel."""
+    pkg_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(pkg_dir, "logo-icon.png"),
+        os.path.join(pkg_dir, "..", "..", "assets", "logo-icon.png"),
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return os.path.normpath(path)
+    return None
 
 # UI Colors
 BG_DARK = "#1e1e2e"
@@ -147,12 +160,12 @@ QToolBar QToolButton:checked {{
 QToolBar QToolButton:pressed {{
     background-color: {ACCENT_BLUE};
 }}
-QLabel#title {{
+QLabel#title_label {{
     font-size: 15px;
     font-weight: bold;
     color: {FG_PRIMARY};
 }}
-QLabel#status {{
+QLabel#status_label {{
     font-size: 12px;
     color: {FG_SECONDARY};
 }}
@@ -507,8 +520,14 @@ class SpeechToTextWindow(QMainWindow):
         # Tracks whether we are currently polishing or have finished polishing.
         self._is_polishing = False
         self._polish_done = False
+        # Tracks whether a full-recording transcription pass is in progress.
+        self._transcribing = False
 
+        self.setObjectName("voxtap_main_window")
         self.setWindowTitle("voxtap")
+        icon_path = _resolve_icon_path()
+        if icon_path:
+            self.setWindowIcon(QIcon(icon_path))
         self.setMinimumSize(400, 300)
         self.resize(750, 520)
         self.setWindowFlags(
@@ -545,21 +564,32 @@ class SpeechToTextWindow(QMainWindow):
         title_bar.setStyleSheet(f"background-color: {BG_MEDIUM};")
         tb_layout = QHBoxLayout(title_bar)
         tb_layout.setContentsMargins(15, 0, 15, 0)
+        tb_layout.setSpacing(10)
+
+        icon_path = _resolve_icon_path()
+        if icon_path:
+            logo_label = QLabel()
+            logo_label.setObjectName("logo_label")
+            logo_pixmap = QIcon(icon_path).pixmap(32, 32)
+            logo_label.setPixmap(logo_pixmap)
+            tb_layout.addWidget(logo_label)
 
         title_label = QLabel("voxtap")
-        title_label.setObjectName("title")
+        title_label.setObjectName("title_label")
         tb_layout.addWidget(title_label)
 
         tb_layout.addStretch()
 
         self.waveform = WaveformWidget()
+        self.waveform.setObjectName("waveform")
         tb_layout.addWidget(self.waveform)
 
         self.polish_indicator = PolishingWidget()
+        self.polish_indicator.setObjectName("polish_indicator")
         tb_layout.addWidget(self.polish_indicator)
 
         self.status_label = QLabel("Loading model...")
-        self.status_label.setObjectName("status")
+        self.status_label.setObjectName("status_label")
         tb_layout.addWidget(self.status_label)
 
         layout.addWidget(title_bar)
@@ -574,10 +604,12 @@ class SpeechToTextWindow(QMainWindow):
 
         style_info = f"color: {FG_SECONDARY}; font-size: 10px;"
         whisper_label = QLabel(f"STT: {self.model_name}")
+        whisper_label.setObjectName("stt_model_label")
         whisper_label.setStyleSheet(style_info)
         info_layout.addWidget(whisper_label)
 
         llm_label = QLabel(f"LLM: {OLLAMA_MODEL}")
+        llm_label.setObjectName("llm_model_label")
         llm_label.setStyleSheet(style_info)
         info_layout.addWidget(llm_label)
 
@@ -586,10 +618,12 @@ class SpeechToTextWindow(QMainWindow):
 
         # --- Formatting toolbar ---
         toolbar = QToolBar()
+        toolbar.setObjectName("main_toolbar")
         toolbar.setMovable(False)
 
         # Bold
         self._bold_action = QAction("B", self)
+        self._bold_action.setObjectName("action_bold")
         self._bold_action.setCheckable(True)
         self._bold_action.setFont(QFont("Sans", 11, QFont.Weight.Bold))
         self._bold_action.setShortcut(QKeySequence("Ctrl+B"))
@@ -598,6 +632,7 @@ class SpeechToTextWindow(QMainWindow):
 
         # Italic
         self._italic_action = QAction("I", self)
+        self._italic_action.setObjectName("action_italic")
         self._italic_action.setCheckable(True)
         f = QFont("Sans", 11)
         f.setItalic(True)
@@ -608,6 +643,7 @@ class SpeechToTextWindow(QMainWindow):
 
         # Underline
         self._underline_action = QAction("U", self)
+        self._underline_action.setObjectName("action_underline")
         self._underline_action.setCheckable(True)
         uf = QFont("Sans", 11)
         uf.setUnderline(True)
@@ -618,6 +654,7 @@ class SpeechToTextWindow(QMainWindow):
 
         # Strikethrough
         self._strike_action = QAction("S\u0336", self)
+        self._strike_action.setObjectName("action_strikethrough")
         self._strike_action.setCheckable(True)
         self._strike_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
         self._strike_action.triggered.connect(self._toggle_strikethrough)
@@ -627,16 +664,19 @@ class SpeechToTextWindow(QMainWindow):
 
         # Headings
         self._h1_action = QAction("H1", self)
+        self._h1_action.setObjectName("action_h1")
         self._h1_action.setCheckable(True)
         self._h1_action.triggered.connect(lambda: self._set_heading(1))
         toolbar.addAction(self._h1_action)
 
         self._h2_action = QAction("H2", self)
+        self._h2_action.setObjectName("action_h2")
         self._h2_action.setCheckable(True)
         self._h2_action.triggered.connect(lambda: self._set_heading(2))
         toolbar.addAction(self._h2_action)
 
         self._h3_action = QAction("H3", self)
+        self._h3_action.setObjectName("action_h3")
         self._h3_action.setCheckable(True)
         self._h3_action.triggered.connect(lambda: self._set_heading(3))
         toolbar.addAction(self._h3_action)
@@ -645,11 +685,13 @@ class SpeechToTextWindow(QMainWindow):
 
         # Lists
         self._bullet_action = QAction("\u2022 List", self)
+        self._bullet_action.setObjectName("action_bullet_list")
         self._bullet_action.setCheckable(True)
         self._bullet_action.triggered.connect(self._toggle_bullet)
         toolbar.addAction(self._bullet_action)
 
         self._numbered_action = QAction("1. List", self)
+        self._numbered_action.setObjectName("action_numbered_list")
         self._numbered_action.setCheckable(True)
         self._numbered_action.triggered.connect(self._toggle_numbered)
         toolbar.addAction(self._numbered_action)
@@ -658,18 +700,21 @@ class SpeechToTextWindow(QMainWindow):
 
         # Alignment
         self._align_left = QAction("\u2261 Left", self)
+        self._align_left.setObjectName("action_align_left")
         self._align_left.triggered.connect(
             lambda: self._set_alignment(Qt.AlignmentFlag.AlignLeft)
         )
         toolbar.addAction(self._align_left)
 
         self._align_center = QAction("\u2261 Center", self)
+        self._align_center.setObjectName("action_align_center")
         self._align_center.triggered.connect(
             lambda: self._set_alignment(Qt.AlignmentFlag.AlignCenter)
         )
         toolbar.addAction(self._align_center)
 
         self._align_right = QAction("\u2261 Right", self)
+        self._align_right.setObjectName("action_align_right")
         self._align_right.triggered.connect(
             lambda: self._set_alignment(Qt.AlignmentFlag.AlignRight)
         )
@@ -683,10 +728,12 @@ class SpeechToTextWindow(QMainWindow):
         editor_layout.setContentsMargins(15, 6, 15, 10)
 
         self.glow_frame = GlowFrame()
+        self.glow_frame.setObjectName("glow_frame")
         glow_inner = QVBoxLayout(self.glow_frame)
         glow_inner.setContentsMargins(0, 0, 0, 0)
 
         self.editor = QTextEdit()
+        self.editor.setObjectName("transcript_edit")
         self.editor.setAcceptRichText(True)
         self.editor.setFont(QFont("Sans", 13))
         self.editor.cursorPositionChanged.connect(self._update_format_buttons)
@@ -705,35 +752,41 @@ class SpeechToTextWindow(QMainWindow):
         btn_layout.addStretch()
 
         self.record_btn = QPushButton("Record")
+        self.record_btn.setObjectName("record_button")
         self.record_btn.setStyleSheet(_btn_style(ACCENT_RED))
         self.record_btn.setEnabled(False)
         self.record_btn.clicked.connect(self._toggle_recording)
         btn_layout.addWidget(self.record_btn)
 
         self.play_btn = QPushButton("Play")
+        self.play_btn.setObjectName("play_button")
         self.play_btn.setStyleSheet(_btn_style(ACCENT_GREEN))
         self.play_btn.setEnabled(False)
         self.play_btn.clicked.connect(self._toggle_playback)
         btn_layout.addWidget(self.play_btn)
 
         self.transcribe_btn = QPushButton("Transcribe")
+        self.transcribe_btn.setObjectName("transcribe_button")
         self.transcribe_btn.setStyleSheet(_btn_style(ACCENT_PURPLE))
         self.transcribe_btn.setEnabled(False)
         self.transcribe_btn.clicked.connect(self._transcribe_full_recording)
         btn_layout.addWidget(self.transcribe_btn)
 
         self.polish_btn = QPushButton("Polish")
+        self.polish_btn.setObjectName("polish_button")
         self.polish_btn.setStyleSheet(_btn_style(ACCENT_BLUE))
         self.polish_btn.setEnabled(False)
         self.polish_btn.clicked.connect(self._polish_current_text)
         btn_layout.addWidget(self.polish_btn)
 
         copy_btn = QPushButton("Copy as Markdown")
+        copy_btn.setObjectName("copy_button")
         copy_btn.setStyleSheet(_btn_style(ACCENT_YELLOW))
         copy_btn.clicked.connect(self.copy_to_clipboard)
         btn_layout.addWidget(copy_btn)
 
         close_btn = QPushButton("Close")
+        close_btn.setObjectName("close_button")
         close_btn.setStyleSheet(_btn_style(FG_SECONDARY))
         close_btn.clicked.connect(self.close)
         btn_layout.addWidget(close_btn)
@@ -1585,6 +1638,7 @@ class SpeechToTextWindow(QMainWindow):
         self._session_start_pos = len(self.editor.toPlainText())
         self._polish_done = False
         self._is_polishing = False
+        self._transcribing = True
 
         self.status_label.setText("Transcribing...")
         self.status_label.setStyleSheet(f"color: {ACCENT_BLUE};")
@@ -1597,6 +1651,7 @@ class SpeechToTextWindow(QMainWindow):
         threading.Thread(target=run, daemon=True).start()
 
     def _on_transcription_complete(self):
+        self._transcribing = False
         self.glow_frame.stop()
         self.record_btn.setEnabled(True)
         if self._recorded_audio is not None:
@@ -1710,10 +1765,31 @@ def main():
     device = args.device if args.device != "auto" else None
 
     app = QApplication(sys.argv)
+    icon_path = _resolve_icon_path()
+    if icon_path:
+        app.setWindowIcon(QIcon(icon_path))
     window = SpeechToTextWindow(
         model_name=args.model, language=args.language, device=device,
     )
     window.show()
+
+    # Optional MCP testability: start TCP control server on localhost only
+    # when VOXTAP_CONTROL_PORT is set. Normal users never open this port.
+    control_port = os.environ.get("VOXTAP_CONTROL_PORT")
+    if control_port:
+        from voxtap.control_server import CommandHandler, run_control_server
+        control_host = os.environ.get("VOXTAP_CONTROL_HOST", "127.0.0.1")
+        handler = CommandHandler(window)
+        # Keep a reference on the window so the server is GC-rooted for the app's lifetime.
+        window._control_handler = handler
+        window._control_server = run_control_server(
+            handler, host=control_host, port=int(control_port),
+        )
+        print(
+            f"VOXTAP_CONTROL_SERVER_READY {control_host}:{control_port}",
+            flush=True,
+        )
+
     sys.exit(app.exec())
 
 
