@@ -31,6 +31,11 @@ dependencies = [
     "PyQt6>=6.5.0",
 ]
 
+[project.optional-dependencies]
+mcp = [
+    "mcp>=1.0.0; python_version>='3.10'",
+]
+
 [project.urls]
 Homepage = "https://github.com/lukaskellerstein/voxtap"
 Issues = "https://github.com/lukaskellerstein/voxtap/issues"
@@ -38,3 +43,6 @@ Issues = "https://github.com/lukaskellerstein/voxtap/issues"
 [project.scripts]
 voxtap = "voxtap.app:main"
 voxtap-toggle = "voxtap.toggle:main"
+
+[tool.hatch.build.targets.wheel.force-include]
+"assets/logo-icon.png" = "voxtap/logo-icon.png"

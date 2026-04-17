@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "voxtap-control": {
+      "command": ".venv/bin/python",
+      "args": ["mcp_server/pyqt_mcp.py"],
+      "env": {
+        "VOXTAP_CONTROL_HOST": "127.0.0.1",
+        "VOXTAP_CONTROL_PORT": "29998"
+      }
+    }
+  }
+}
